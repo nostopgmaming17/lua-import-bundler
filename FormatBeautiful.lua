@@ -182,7 +182,7 @@ local function Format_Beautify(ast)
 					end
 				end
 			end
-		elseif statement.AstType == 'SpecialAssignemntStatement' then
+		elseif statement.AstType == 'SpecialAssignmentStatement' then
 			out = getIndentation()
 			out = out .. formatExpr(statement.Lhs)
             out = out .. statement.Operator
