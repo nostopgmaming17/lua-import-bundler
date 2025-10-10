@@ -69,9 +69,38 @@ local function normalizePath(path)
     return table.concat(parts, "/")
 end
 
+-- Get full member path from an expression
+local function getMemberPath(node)
+    if not node then return nil end
+
+    if node.AstType == 'VarExpr' then
+        return node.Name
+    elseif node.AstType == 'MemberExpr' then
+        local base = getMemberPath(node.Base)
+        if base then
+            -- Handle both string idents and table idents
+            local ident = type(node.Ident) == 'table' and node.Ident.Data or node.Ident
+            if ident then
+                return base .. "." .. ident
+            end
+        end
+    elseif node.AstType == 'IndexExpr' then
+        local base = getMemberPath(node.Base)
+        -- Only handle string literal indices
+        if base and node.Index and node.Index.AstType == 'StringExpr' then
+            local value = type(node.Index.Value) == 'table' and node.Index.Value.Data or node.Index.Value
+            if value then
+                return base .. "." .. value
+            end
+        end
+    end
+    return nil
+end
+
 -- Extract all identifiers from AST node
-local function extractIdentifiers(node, identifiers)
+local function extractIdentifiers(node, identifiers, isCallBase)
     identifiers = identifiers or {}
+    isCallBase = isCallBase or false
 
     if not node then
         return identifiers
@@ -80,22 +109,43 @@ local function extractIdentifiers(node, identifiers)
     if node.AstType == 'VarExpr' then
         identifiers[node.Name] = true
     elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' then
-        extractIdentifiers(node.Base, identifiers)
+        -- For calls, track the full member path if it's a method/property call
+        local memberPath = getMemberPath(node.Base)
+        if memberPath and memberPath:find("%.") then
+            -- It's a method/property call like table.method()
+            identifiers[memberPath] = true
+        end
+        -- Also extract from base and arguments
+        extractIdentifiers(node.Base, identifiers, true)
         if node.Arguments then
             for _, arg in ipairs(node.Arguments) do
-                extractIdentifiers(arg, identifiers)
+                extractIdentifiers(arg, identifiers, false)
             end
         end
     elseif node.AstType == 'BinopExpr' then
-        extractIdentifiers(node.Lhs, identifiers)
-        extractIdentifiers(node.Rhs, identifiers)
+        extractIdentifiers(node.Lhs, identifiers, false)
+        extractIdentifiers(node.Rhs, identifiers, false)
     elseif node.AstType == 'UnopExpr' then
-        extractIdentifiers(node.Rhs, identifiers)
+        extractIdentifiers(node.Rhs, identifiers, false)
     elseif node.AstType == 'IndexExpr' then
-        extractIdentifiers(node.Base, identifiers)
-        extractIdentifiers(node.Index, identifiers)
+        -- Track the full path if accessing a member
+        if not isCallBase then
+            local memberPath = getMemberPath(node)
+            if memberPath and memberPath:find("%.") then
+                identifiers[memberPath] = true
+            end
+        end
+        extractIdentifiers(node.Base, identifiers, false)
+        extractIdentifiers(node.Index, identifiers, false)
     elseif node.AstType == 'MemberExpr' then
-        extractIdentifiers(node.Base, identifiers)
+        -- Track the full path if accessing a member
+        if not isCallBase then
+            local memberPath = getMemberPath(node)
+            if memberPath and memberPath:find("%.") then
+                identifiers[memberPath] = true
+            end
+        end
+        extractIdentifiers(node.Base, identifiers, false)
     elseif node.AstType == 'Function' then
         if node.Body and node.Body.Body then
             for _, stmt in ipairs(node.Body.Body) do
@@ -103,12 +153,12 @@ local function extractIdentifiers(node, identifiers)
             end
         end
     elseif node.AstType == 'Parentheses' then
-        extractIdentifiers(node.Inner, identifiers)
+        extractIdentifiers(node.Inner, identifiers, isCallBase)
     elseif node.AstType == 'ConstructorExpr' then
         if node.EntryList then
             for _, entry in ipairs(node.EntryList) do
-                if entry.Key then extractIdentifiers(entry.Key, identifiers) end
-                if entry.Value then extractIdentifiers(entry.Value, identifiers) end
+                if entry.Key then extractIdentifiers(entry.Key, identifiers, false) end
+                if entry.Value then extractIdentifiers(entry.Value, identifiers, false) end
             end
         end
     end
@@ -276,7 +326,13 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         end
     end
 
-    -- Process files (dependencies come first in the files list)
+    -- Process files and track which file is the entry point
+    local entryFilePath = files[#files].path  -- Entry file is last (gathered last)
+    local fileOrderIndex = {}  -- Track original file order
+    for i = 1, #files do
+        fileOrderIndex[files[i].path] = i
+    end
+
     for i = 1, #files do
         local file = files[i]
         local fileImportMap = {} -- Maps alias -> {sourcePath, originalName, renamedName}
@@ -316,28 +372,55 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
         -- Process AST statements
         if file.ast.Body then
+            local stmtIndexInFile = 0
             for _, stmt in ipairs(file.ast.Body) do
+                stmtIndexInFile = stmtIndexInFile + 1
                 local itemId = file.name .. "_" .. itemIdCounter
                 itemIdCounter = itemIdCounter + 1
 
-                -- Handle function declarations
+                -- Calculate statement index: entry file items get low numbers (0-999),
+                -- imported files get high numbers based on their file order
+                local stmtIndex
+                if file.path == entryFilePath then
+                    stmtIndex = stmtIndexInFile  -- 1, 2, 3, ... for entry file
+                else
+                    -- Imported files: use file order * 100000 + statement position
+                    -- This puts them after entry file items in the sort
+                    stmtIndex = fileOrderIndex[file.path] * 100000 + stmtIndexInFile
+                end
+
+                -- Handle function declarations (including method definitions)
                 if stmt.AstType == 'Function' and stmt.Name then
                     local originalName = stmt.Name.Name or stmt.Name
+                    local isMethod = false
+                    local methodPath = nil
+
+                    -- Check if this is a method definition (e.g., function Table:method() or Table.method())
+                    if type(stmt.Name) == 'table' and stmt.Name.AstType then
+                        methodPath = getMemberPath(stmt.Name)
+                        if methodPath and methodPath:find("%.") then
+                            isMethod = true
+                            originalName = methodPath
+                        end
+                    end
 
                     -- Check if this is an exported function (already has a unique name assigned)
                     local uniqueName
-                    if exportedVars[file.path] and exportedVars[file.path][originalName] then
+                    if not isMethod and exportedVars[file.path] and exportedVars[file.path][originalName] then
                         uniqueName = exportedVars[file.path][originalName]
-                    else
+                    elseif not isMethod then
                         -- Non-exported local function
                         uniqueName = getUniqueName(originalName)
                         if uniqueName ~= originalName then
                             globalRenameMap[originalName] = uniqueName
                         end
+                    else
+                        -- Method definition - keep the original path structure but rename if needed
+                        uniqueName = originalName
                     end
 
-                    -- Update the AST
-                    if type(stmt.Name) == 'table' then
+                    -- Update the AST for non-method functions
+                    if not isMethod and type(stmt.Name) == 'table' then
                         stmt.Name.Name = uniqueName
                     end
 
@@ -345,14 +428,17 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
                     table.insert(allItems, {
                         id = itemId,
-                        type = 'function',
+                        type = isMethod and 'method' or 'function',
                         name = uniqueName,
                         originalName = originalName,
+                        methodPath = methodPath,
                         stmt = stmt,
                         dependencies = deps,
                         importedNames = fileImportedNames,
                         importMap = fileImportMap,
                         fileOrder = i,
+                        filePath = file.path,
+                        stmtIndex = stmtIndex,
                         isDeclaration = true
                     })
 
@@ -396,8 +482,54 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         importMap = fileImportMap,
                         fileOrder = i,
                         fileIndex = i,
+                        filePath = file.path,
+                        stmtIndex = stmtIndex,
                         isDeclaration = true
                     })
+
+                -- Handle assignment statements (check for method assignments)
+                elseif stmt.AstType == 'AssignmentStatement' and stmt.Lhs and #stmt.Lhs == 1 and stmt.Rhs and #stmt.Rhs == 1 then
+                    local lhs = stmt.Lhs[1]
+                    local rhs = stmt.Rhs[1]
+
+                    -- Check if this is assigning a function to a table member (e.g., Table.method = function())
+                    local memberPath = getMemberPath(lhs)
+                    if memberPath and memberPath:find("%.") and rhs.AstType == 'Function' then
+                        -- This is a method definition via assignment
+                        local deps = extractIdentifiersFromStatement(stmt, {})
+
+                        table.insert(allItems, {
+                            id = itemId,
+                            type = 'method',
+                            name = memberPath,
+                            originalName = memberPath,
+                            methodPath = memberPath,
+                            stmt = stmt,
+                            dependencies = deps,
+                            importedNames = fileImportedNames,
+                            importMap = fileImportMap,
+                            fileOrder = i,
+                            filePath = file.path,
+                            stmtIndex = stmtIndex,
+                            isDeclaration = true
+                        })
+                    else
+                        -- Regular assignment
+                        local deps = extractIdentifiersFromStatement(stmt, {})
+
+                        table.insert(allItems, {
+                            id = itemId,
+                            type = 'statement',
+                            stmt = stmt,
+                            dependencies = deps,
+                            importedNames = fileImportedNames,
+                            importMap = fileImportMap,
+                            fileOrder = i,
+                            filePath = file.path,
+                            stmtIndex = stmtIndex,
+                            isDeclaration = false
+                        })
+                    end
 
                 -- Handle other statements
                 else
@@ -411,6 +543,8 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         importedNames = fileImportedNames,
                         importMap = fileImportMap,
                         fileOrder = i,
+                        filePath = file.path,
+                        stmtIndex = stmtIndex,
                         isDeclaration = false
                     })
                 end
@@ -419,6 +553,8 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
     end
 
     -- Apply global renames and import maps to all AST nodes
+    local renameInStatement  -- Forward declaration
+
     local function renameInNode(node, importedNames, importMap)
         if not node then return end
 
@@ -455,6 +591,13 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
             renameInNode(node.Base, importedNames, importMap)
         elseif node.AstType == 'Parentheses' then
             renameInNode(node.Inner, importedNames, importMap)
+        elseif node.AstType == 'Function' then
+            -- Rename inside function bodies
+            if node.Body and node.Body.Body then
+                for _, s in ipairs(node.Body.Body) do
+                    renameInStatement(s, importedNames, importMap)
+                end
+            end
         elseif node.AstType == 'ConstructorExpr' and node.EntryList then
             for _, entry in ipairs(node.EntryList) do
                 if entry.Key then renameInNode(entry.Key, importedNames, importMap) end
@@ -463,7 +606,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         end
     end
 
-    local function renameInStatement(stmt, importedNames, importMap)
+    renameInStatement = function(stmt, importedNames, importMap)
         importMap = importMap or {}
         if stmt.AstType == 'CallStatement' then
             renameInNode(stmt.Expression, importedNames, importMap)
@@ -492,6 +635,59 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
             for _, s in ipairs(stmt.Body.Body) do
                 renameInStatement(s, importedNames, importMap)
             end
+        elseif stmt.AstType == 'IfStatement' then
+            -- Rename condition
+            if stmt.Clauses then
+                for _, clause in ipairs(stmt.Clauses) do
+                    if clause.Condition then
+                        renameInNode(clause.Condition, importedNames, importMap)
+                    end
+                    if clause.Body and clause.Body.Body then
+                        for _, s in ipairs(clause.Body.Body) do
+                            renameInStatement(s, importedNames, importMap)
+                        end
+                    end
+                end
+            end
+        elseif stmt.AstType == 'WhileStatement' then
+            if stmt.Condition then
+                renameInNode(stmt.Condition, importedNames, importMap)
+            end
+            if stmt.Body and stmt.Body.Body then
+                for _, s in ipairs(stmt.Body.Body) do
+                    renameInStatement(s, importedNames, importMap)
+                end
+            end
+        elseif stmt.AstType == 'RepeatStatement' then
+            if stmt.Condition then
+                renameInNode(stmt.Condition, importedNames, importMap)
+            end
+            if stmt.Body and stmt.Body.Body then
+                for _, s in ipairs(stmt.Body.Body) do
+                    renameInStatement(s, importedNames, importMap)
+                end
+            end
+        elseif stmt.AstType == 'NumericForStatement' or stmt.AstType == 'GenericForStatement' then
+            -- Rename loop expressions
+            if stmt.Start then renameInNode(stmt.Start, importedNames, importMap) end
+            if stmt.End then renameInNode(stmt.End, importedNames, importMap) end
+            if stmt.Step then renameInNode(stmt.Step, importedNames, importMap) end
+            if stmt.Generators then
+                for _, gen in ipairs(stmt.Generators) do
+                    renameInNode(gen, importedNames, importMap)
+                end
+            end
+            if stmt.Body and stmt.Body.Body then
+                for _, s in ipairs(stmt.Body.Body) do
+                    renameInStatement(s, importedNames, importMap)
+                end
+            end
+        elseif stmt.AstType == 'DoStatement' then
+            if stmt.Body and stmt.Body.Body then
+                for _, s in ipairs(stmt.Body.Body) do
+                    renameInStatement(s, importedNames, importMap)
+                end
+            end
         end
     end
 
@@ -500,65 +696,79 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         renameInStatement(item.stmt, item.importedNames or {}, item.importMap or {})
     end
 
-    -- Topological sort
-    local declarations = {}
-    local statements = {}
-    for _, item in ipairs(allItems) do
-        if item.isDeclaration then
-            table.insert(declarations, item)
-        else
-            table.insert(statements, item)
-        end
-    end
-
-    local sorted = {}
-    local visited = {}
-    local visiting = {}
+    -- Build dependency lookup for just-in-time insertion
     local itemByName = {}
-
-    for _, item in ipairs(declarations) do
-        if item.type == 'function' then
-            itemByName[item.name] = item
-        elseif item.type == 'variable' then
-            for _, name in ipairs(item.names) do
-                itemByName[name] = item
+    local itemById = {}
+    for _, item in ipairs(allItems) do
+        itemById[item.id] = item
+        if item.isDeclaration then
+            if item.type == 'function' then
+                itemByName[item.name] = item
+            elseif item.type == 'method' then
+                itemByName[item.methodPath or item.name] = item
+            elseif item.type == 'variable' then
+                for _, name in ipairs(item.names) do
+                    itemByName[name] = item
+                end
             end
         end
     end
 
-    local function visit(item)
-        if not item or visited[item.id] or visiting[item.id] then
+    -- Separate entry file items from imported items
+    local entryItems = {}
+    local importedItems = {}
+
+    for _, item in ipairs(allItems) do
+        if item.filePath == entryFilePath then
+            table.insert(entryItems, item)
+        else
+            table.insert(importedItems, item)
+        end
+    end
+
+    -- Sort each group by their statement index within their file
+    table.sort(entryItems, function(a, b)
+        return a.stmtIndex < b.stmtIndex
+    end)
+    table.sort(importedItems, function(a, b)
+        return a.stmtIndex < b.stmtIndex
+    end)
+
+    -- Build output by processing entry file in order and inserting dependencies just-in-time
+    local sorted = {}
+    local added = {}
+
+    local function addItem(item)
+        if added[item.id] then
             return
         end
 
-        visiting[item.id] = true
-
+        -- Add dependencies first (just-in-time)
         for depName in pairs(item.dependencies) do
-            -- Apply import map to resolve aliases
             local resolvedName = depName
             if item.importMap and item.importMap[depName] then
                 resolvedName = item.importMap[depName]
             end
 
             local depItem = itemByName[resolvedName]
-            if depItem and depItem.id ~= item.id then
-                visit(depItem)
+            if depItem and depItem.id ~= item.id and not added[depItem.id] then
+                addItem(depItem)
             end
         end
 
-        visiting[item.id] = nil
-        visited[item.id] = true
+        -- Add this item
         table.insert(sorted, item)
+        added[item.id] = true
     end
 
-    -- Visit all declarations (topological sort will determine order)
-    for _, item in ipairs(declarations) do
-        visit(item)
+    -- Process entry file items first (they'll pull in dependencies as needed)
+    for _, item in ipairs(entryItems) do
+        addItem(item)
     end
 
-    -- Add statements in their original order
-    for _, item in ipairs(statements) do
-        table.insert(sorted, item)
+    -- Process any remaining imported items that weren't pulled in as dependencies
+    for _, item in ipairs(importedItems) do
+        addItem(item)
     end
 
     -- Generate output AST
