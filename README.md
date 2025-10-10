@@ -2,7 +2,7 @@
 
 A modern JavaScript/TypeScript-style import/export bundler for Lua and Luau. Write modular Lua code with ES6-style `import`/`export` syntax and bundle it into a single optimized file.
 
-[Lua ES6 VSCode Extension](https://github.com/nostopgmaming17/lua-es6-vscode-extension)
+[Lua Import VSCode Extension](https://github.com/nostopgmaming17/lua-import-vscode-extension)
 
 ## Features
 
