@@ -383,10 +383,14 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         fileOrderIndex[files[i].path] = i
     end
 
+    -- Track exports that need to be renamed due to conflicts with non-imported usage
+    local exportsNeedingRename = {} -- Maps filePath -> originalName -> true
+
     for i = 1, #files do
         local file = files[i]
         local fileImportMap = {} -- Maps alias -> {sourcePath, originalName, renamedName}
         local fileImportedNames = {}
+        local fileAllowedExports = {} -- Track which exports this file can access (via imports)
 
         -- Build import map for this file
         for _, imp in ipairs(file.imports) do
@@ -416,6 +420,28 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                 if actualName then
                     fileImportMap[item.alias] = actualName
                     fileImportedNames[item.alias] = true
+                    -- Only allow direct access to the export if NO alias is used
+                    -- If "import b as d" is used, the file can only use "d", not "b"
+                    if item.alias == item.name then
+                        fileAllowedExports[actualName] = true
+                    end
+                end
+            end
+        end
+
+        -- Build a set of all exports from OTHER files that this file can access
+        -- If a file uses an export name without importing it, we need to rename that export
+        local exportNamesToCheck = {}
+        for otherFilePath, exports in pairs(exportedVars) do
+            if otherFilePath ~= file.path then
+                for originalName, exportName in pairs(exports) do
+                    if not fileAllowedExports[exportName] then
+                        -- Track this export so we can check if it's used
+                        exportNamesToCheck[exportName] = {
+                            filePath = otherFilePath,
+                            originalName = originalName
+                        }
+                    end
                 end
             end
         end
@@ -482,6 +508,18 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
                     local deps = extractIdentifiersFromStatement(stmt, {})
 
+                    -- Check if this statement uses any exports without importing them
+                    -- Mark those exports for renaming
+                    for depName in pairs(deps) do
+                        if exportNamesToCheck[depName] then
+                            local exportInfo = exportNamesToCheck[depName]
+                            if not exportsNeedingRename[exportInfo.filePath] then
+                                exportsNeedingRename[exportInfo.filePath] = {}
+                            end
+                            exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                        end
+                    end
+
                     table.insert(allItems, {
                         id = itemId,
                         type = isMethod and 'method' or 'function',
@@ -534,6 +572,18 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
                     local deps = extractIdentifiersFromStatement(stmt, {})
 
+                    -- Check if this statement uses any exports without importing them
+                    -- Mark those exports for renaming
+                    for depName in pairs(deps) do
+                        if exportNamesToCheck[depName] then
+                            local exportInfo = exportNamesToCheck[depName]
+                            if not exportsNeedingRename[exportInfo.filePath] then
+                                exportsNeedingRename[exportInfo.filePath] = {}
+                            end
+                            exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                        end
+                    end
+
                     table.insert(allItems, {
                         id = itemId,
                         type = 'variable',
@@ -563,6 +613,17 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         -- This is a method definition via assignment
                         local deps = extractIdentifiersFromStatement(stmt, {})
 
+                        -- Check if this statement uses any exports without importing them
+                        for depName in pairs(deps) do
+                            if exportNamesToCheck[depName] then
+                                local exportInfo = exportNamesToCheck[depName]
+                                if not exportsNeedingRename[exportInfo.filePath] then
+                                    exportsNeedingRename[exportInfo.filePath] = {}
+                                end
+                                exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                            end
+                        end
+
                         table.insert(allItems, {
                             id = itemId,
                             type = 'method',
@@ -585,6 +646,17 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         -- This is a member assignment (not a function, but still important for ordering)
                         local deps = extractIdentifiersFromStatement(stmt, {})
 
+                        -- Check if this statement uses any exports without importing them
+                        for depName in pairs(deps) do
+                            if exportNamesToCheck[depName] then
+                                local exportInfo = exportNamesToCheck[depName]
+                                if not exportsNeedingRename[exportInfo.filePath] then
+                                    exportsNeedingRename[exportInfo.filePath] = {}
+                                end
+                                exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                            end
+                        end
+
                         table.insert(allItems, {
                             id = itemId,
                             type = 'member_assignment',
@@ -603,6 +675,17 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                     else
                         -- Regular assignment
                         local deps = extractIdentifiersFromStatement(stmt, {})
+
+                        -- Check if this statement uses any exports without importing them
+                        for depName in pairs(deps) do
+                            if exportNamesToCheck[depName] then
+                                local exportInfo = exportNamesToCheck[depName]
+                                if not exportsNeedingRename[exportInfo.filePath] then
+                                    exportsNeedingRename[exportInfo.filePath] = {}
+                                end
+                                exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                            end
+                        end
 
                         table.insert(allItems, {
                             id = itemId,
@@ -623,6 +706,17 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                 else
                     local deps = extractIdentifiersFromStatement(stmt, {})
 
+                    -- Check if this statement uses any exports without importing them
+                    for depName in pairs(deps) do
+                        if exportNamesToCheck[depName] then
+                            local exportInfo = exportNamesToCheck[depName]
+                            if not exportsNeedingRename[exportInfo.filePath] then
+                                exportsNeedingRename[exportInfo.filePath] = {}
+                            end
+                            exportsNeedingRename[exportInfo.filePath][exportInfo.originalName] = true
+                        end
+                    end
+
                     table.insert(allItems, {
                         id = itemId,
                         type = 'statement',
@@ -636,6 +730,64 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         stmtIndex = stmtIndex,
                         isDeclaration = false
                     })
+                end
+            end
+        end
+    end
+
+    -- Apply the renames to exports that were used without imports
+    -- This ensures each file's local variables don't conflict with exports
+    for filePath, exports in pairs(exportsNeedingRename) do
+        for originalName in pairs(exports) do
+            if exportedVars[filePath] and exportedVars[filePath][originalName] then
+                local currentName = exportedVars[filePath][originalName]
+                -- Get a new unique name for this export
+                local newName = getUniqueName(currentName)
+
+                -- Update exportedVars to use the new name
+                exportedVars[filePath][originalName] = newName
+
+                -- Update fileSpecificRenames
+                if fileSpecificRenames[filePath] then
+                    fileSpecificRenames[filePath][originalName] = newName
+                end
+
+                -- Update all items that use this export
+                for _, item in ipairs(allItems) do
+                    -- Update items from the same file (the file that exports it)
+                    if item.filePath == filePath then
+                        if item.type == 'function' and item.name == currentName then
+                            item.name = newName
+                            -- Update AST
+                            if item.stmt.Name and type(item.stmt.Name) == 'table' then
+                                item.stmt.Name.Name = newName
+                            end
+                        elseif item.type == 'variable' then
+                            for i, name in ipairs(item.names) do
+                                if name == currentName then
+                                    item.names[i] = newName
+                                    -- Update AST
+                                    if item.stmt.LocalList and item.stmt.LocalList[i] then
+                                        item.stmt.LocalList[i].Name = newName
+                                    end
+                                end
+                            end
+                        end
+
+                        -- Update fileRenameMap for this item
+                        if item.fileRenameMap then
+                            item.fileRenameMap[originalName] = newName
+                        end
+                    end
+
+                    -- Update import maps in other files that import this
+                    if item.importMap then
+                        for alias, importedName in pairs(item.importMap) do
+                            if importedName == currentName then
+                                item.importMap[alias] = newName
+                            end
+                        end
+                    end
                 end
             end
         end
