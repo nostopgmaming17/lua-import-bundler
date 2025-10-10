@@ -115,6 +115,20 @@ local function extractIdentifiers(node, identifiers, isCallBase)
             -- It's a method/property call like table.method()
             identifiers[memberPath] = true
         end
+
+        -- Special handling for setmetatable(x, Table) - depend on Table's member assignments
+        local baseName = getMemberPath(node.Base)
+        if baseName == "setmetatable" and node.Arguments and #node.Arguments >= 2 then
+            local metatableName = getMemberPath(node.Arguments[2])
+            if metatableName and not metatableName:find("%.") then
+                -- Mark dependency on Table.__index, Table.__newindex, etc.
+                -- This ensures they come before functions that use setmetatable
+                identifiers[metatableName .. ".__index"] = true
+                identifiers[metatableName .. ".__newindex"] = true
+                identifiers[metatableName .. ".__metatable"] = true
+            end
+        end
+
         -- Also extract from base and arguments
         extractIdentifiers(node.Base, identifiers, true)
         if node.Arguments then
@@ -287,6 +301,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
     -- Start gathering from entry
     local entryDir = getDirectory(entryPath)
     local entryName = entryPath:match("([^/]+)$")
+    local entryFullPath = normalizePath(entryDir .. entryName)
     gatherFiles(entryName, entryDir)
 
     -- Build items list with declarations and statements
@@ -310,24 +325,59 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         return newName
     end
 
-    -- First pass: collect all exports and assign unique names
+    -- Entry file path is the one specified in entryPath
+    local entryFilePath = entryFullPath
+
+    -- PRIORITY: Imported file exports get priority for original names
+    -- Entry file variables are renamed if they conflict
+
+    -- Step 1: For imported files, exports get UNIQUE global names (first gets priority)
+    -- The first file that exports 'maid' gets to keep 'maid', second gets 'maid2', etc.
+    -- IMPORTANT: Process imported files FIRST to claim names
+    local fileSpecificRenames = {}  -- Maps file.path -> originalName -> uniqueName
+
     for i = 1, #files do
         local file = files[i]
         exportedVars[file.path] = {}
+        fileSpecificRenames[file.path] = {}
+    end
 
-        for _, exp in ipairs(file.exports) do
-            for _, name in ipairs(exp.names) do
-                local uniqueName = getUniqueName(name)
-                exportedVars[file.path][name] = uniqueName
-                if uniqueName ~= name then
-                    globalRenameMap[name] = uniqueName
+    -- Process imported files first to claim their export names
+    for i = 1, #files do
+        local file = files[i]
+        if file.path ~= entryFilePath then
+            -- Imported files: exports get unique names (priority to first occurrence)
+            for _, exp in ipairs(file.exports) do
+                for _, name in ipairs(exp.names) do
+                    local uniqueName = getUniqueName(name)
+                    exportedVars[file.path][name] = uniqueName
+                    -- Track this in fileSpecificRenames
+                    fileSpecificRenames[file.path][name] = uniqueName
+                end
+            end
+        end
+    end
+
+    -- Step 2: Entry file exports (if any) get renamed to avoid conflicts
+    -- Entry file locals will be handled during AST processing (no pre-scan needed)
+    local entryFileVarNames = {}
+    for i = 1, #files do
+        local file = files[i]
+        if file.path == entryFilePath then
+            -- Process exports only (not locals - those will be processed during AST processing)
+            for _, exp in ipairs(file.exports) do
+                for _, name in ipairs(exp.names) do
+                    if not entryFileVarNames[name] then
+                        local uniqueName = getUniqueName(name)  -- Will be renamed if conflicts exist
+                        entryFileVarNames[name] = uniqueName
+                        exportedVars[file.path][name] = uniqueName
+                    end
                 end
             end
         end
     end
 
     -- Process files and track which file is the entry point
-    local entryFilePath = files[#files].path  -- Entry file is last (gathered last)
     local fileOrderIndex = {}  -- Track original file order
     for i = 1, #files do
         fileOrderIndex[files[i].path] = i
@@ -407,10 +457,16 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                     -- Check if this is an exported function (already has a unique name assigned)
                     local uniqueName
                     if not isMethod and exportedVars[file.path] and exportedVars[file.path][originalName] then
+                        -- Exported function: use the assigned name (for imported files, this is the original name)
                         uniqueName = exportedVars[file.path][originalName]
+                        -- Don't add to globalRenameMap - we want to keep the original name
+                    elseif not isMethod and file.path == entryFilePath and entryFileVarNames[originalName] then
+                        -- Entry file's function: use pre-assigned name
+                        uniqueName = entryFileVarNames[originalName]
                     elseif not isMethod then
-                        -- Non-exported local function
+                        -- Non-exported local function (from any file)
                         uniqueName = getUniqueName(originalName)
+                        -- Only add to globalRenameMap if this is from the entry file OR if it actually got renamed
                         if uniqueName ~= originalName then
                             globalRenameMap[originalName] = uniqueName
                         end
@@ -436,6 +492,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         dependencies = deps,
                         importedNames = fileImportedNames,
                         importMap = fileImportMap,
+                        fileRenameMap = fileSpecificRenames[file.path] or {},
                         fileOrder = i,
                         filePath = file.path,
                         stmtIndex = stmtIndex,
@@ -454,10 +511,16 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         -- Check if this is an exported variable (already has a unique name assigned)
                         local uniqueName
                         if exportedVars[file.path] and exportedVars[file.path][originalName] then
+                            -- Exported variable: use the assigned name (for imported files, this is the original name)
                             uniqueName = exportedVars[file.path][originalName]
+                            -- Don't add to globalRenameMap - we want to keep the original name
+                        elseif file.path == entryFilePath and entryFileVarNames[originalName] then
+                            -- Entry file's variable: use pre-assigned name
+                            uniqueName = entryFileVarNames[originalName]
                         else
-                            -- Non-exported local variable
+                            -- Non-exported local variable (from any file)
                             uniqueName = getUniqueName(originalName)
+                            -- Only add to globalRenameMap if it actually got renamed
                             if uniqueName ~= originalName then
                                 globalRenameMap[originalName] = uniqueName
                             end
@@ -480,6 +543,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         dependencies = deps,
                         importedNames = fileImportedNames,
                         importMap = fileImportMap,
+                        fileRenameMap = fileSpecificRenames[file.path] or {},
                         fileOrder = i,
                         fileIndex = i,
                         filePath = file.path,
@@ -487,13 +551,14 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         isDeclaration = true
                     })
 
-                -- Handle assignment statements (check for method assignments)
+                -- Handle assignment statements (check for method assignments and member assignments)
                 elseif stmt.AstType == 'AssignmentStatement' and stmt.Lhs and #stmt.Lhs == 1 and stmt.Rhs and #stmt.Rhs == 1 then
                     local lhs = stmt.Lhs[1]
                     local rhs = stmt.Rhs[1]
 
-                    -- Check if this is assigning a function to a table member (e.g., Table.method = function())
                     local memberPath = getMemberPath(lhs)
+
+                    -- Check if this is assigning a function to a table member (e.g., Table.method = function())
                     if memberPath and memberPath:find("%.") and rhs.AstType == 'Function' then
                         -- This is a method definition via assignment
                         local deps = extractIdentifiersFromStatement(stmt, {})
@@ -508,10 +573,32 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                             dependencies = deps,
                             importedNames = fileImportedNames,
                             importMap = fileImportMap,
+                            fileRenameMap = fileSpecificRenames[file.path] or {},
                             fileOrder = i,
                             filePath = file.path,
                             stmtIndex = stmtIndex,
                             isDeclaration = true
+                        })
+                    -- Check if this is a table member assignment (e.g., Table.__index = Table, Table.prototype = {})
+                    -- Treat these as declarations so dependency ordering recognizes them
+                    elseif memberPath and memberPath:find("%.") then
+                        -- This is a member assignment (not a function, but still important for ordering)
+                        local deps = extractIdentifiersFromStatement(stmt, {})
+
+                        table.insert(allItems, {
+                            id = itemId,
+                            type = 'member_assignment',
+                            name = memberPath,
+                            originalName = memberPath,
+                            stmt = stmt,
+                            dependencies = deps,
+                            importedNames = fileImportedNames,
+                            importMap = fileImportMap,
+                            fileRenameMap = fileSpecificRenames[file.path] or {},
+                            fileOrder = i,
+                            filePath = file.path,
+                            stmtIndex = stmtIndex,
+                            isDeclaration = true  -- Mark as declaration so it can be found by dependency tracker
                         })
                     else
                         -- Regular assignment
@@ -524,6 +611,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                             dependencies = deps,
                             importedNames = fileImportedNames,
                             importMap = fileImportMap,
+                            fileRenameMap = fileSpecificRenames[file.path] or {},
                             fileOrder = i,
                             filePath = file.path,
                             stmtIndex = stmtIndex,
@@ -542,6 +630,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         dependencies = deps,
                         importedNames = fileImportedNames,
                         importMap = fileImportMap,
+                        fileRenameMap = fileSpecificRenames[file.path] or {},
                         fileOrder = i,
                         filePath = file.path,
                         stmtIndex = stmtIndex,
@@ -555,17 +644,23 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
     -- Apply global renames and import maps to all AST nodes
     local renameInStatement  -- Forward declaration
 
-    local function renameInNode(node, importedNames, importMap)
+    local function renameInNode(node, importedNames, importMap, fileRenameMap)
         if not node then return end
 
         if node.AstType == 'VarExpr' then
-            -- First check import map (e.g., d -> b)
+            -- First check import map (e.g., rpgstingermaid -> maid)
             if importMap[node.Name] then
                 node.Name = importMap[node.Name]
                 if node.Variable then
                     node.Variable.Name = node.Name
                 end
-            -- Then apply global renames if not imported
+            -- Then check file-specific renames (e.g., maid -> maid2 within this specific file)
+            elseif not importedNames[node.Name] and fileRenameMap and fileRenameMap[node.Name] then
+                node.Name = fileRenameMap[node.Name]
+                if node.Variable then
+                    node.Variable.Name = node.Name
+                end
+            -- Finally apply global renames if not imported
             elseif not importedNames[node.Name] then
                 node.Name = globalRenameMap[node.Name] or node.Name
                 if node.Variable then
@@ -573,119 +668,120 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                 end
             end
         elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' then
-            renameInNode(node.Base, importedNames, importMap)
+            renameInNode(node.Base, importedNames, importMap, fileRenameMap)
             if node.Arguments then
                 for _, arg in ipairs(node.Arguments) do
-                    renameInNode(arg, importedNames, importMap)
+                    renameInNode(arg, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif node.AstType == 'BinopExpr' then
-            renameInNode(node.Lhs, importedNames, importMap)
-            renameInNode(node.Rhs, importedNames, importMap)
+            renameInNode(node.Lhs, importedNames, importMap, fileRenameMap)
+            renameInNode(node.Rhs, importedNames, importMap, fileRenameMap)
         elseif node.AstType == 'UnopExpr' then
-            renameInNode(node.Rhs, importedNames, importMap)
+            renameInNode(node.Rhs, importedNames, importMap, fileRenameMap)
         elseif node.AstType == 'IndexExpr' then
-            renameInNode(node.Base, importedNames, importMap)
-            renameInNode(node.Index, importedNames, importMap)
+            renameInNode(node.Base, importedNames, importMap, fileRenameMap)
+            renameInNode(node.Index, importedNames, importMap, fileRenameMap)
         elseif node.AstType == 'MemberExpr' then
-            renameInNode(node.Base, importedNames, importMap)
+            renameInNode(node.Base, importedNames, importMap, fileRenameMap)
         elseif node.AstType == 'Parentheses' then
-            renameInNode(node.Inner, importedNames, importMap)
+            renameInNode(node.Inner, importedNames, importMap, fileRenameMap)
         elseif node.AstType == 'Function' then
             -- Rename inside function bodies
             if node.Body and node.Body.Body then
                 for _, s in ipairs(node.Body.Body) do
-                    renameInStatement(s, importedNames, importMap)
+                    renameInStatement(s, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif node.AstType == 'ConstructorExpr' and node.EntryList then
             for _, entry in ipairs(node.EntryList) do
-                if entry.Key then renameInNode(entry.Key, importedNames, importMap) end
-                if entry.Value then renameInNode(entry.Value, importedNames, importMap) end
+                if entry.Key then renameInNode(entry.Key, importedNames, importMap, fileRenameMap) end
+                if entry.Value then renameInNode(entry.Value, importedNames, importMap, fileRenameMap) end
             end
         end
     end
 
-    renameInStatement = function(stmt, importedNames, importMap)
+    renameInStatement = function(stmt, importedNames, importMap, fileRenameMap)
         importMap = importMap or {}
+        fileRenameMap = fileRenameMap or {}
         if stmt.AstType == 'CallStatement' then
-            renameInNode(stmt.Expression, importedNames, importMap)
+            renameInNode(stmt.Expression, importedNames, importMap, fileRenameMap)
         elseif stmt.AstType == 'AssignmentStatement' then
             if stmt.Lhs then
                 for _, expr in ipairs(stmt.Lhs) do
-                    renameInNode(expr, importedNames, importMap)
+                    renameInNode(expr, importedNames, importMap, fileRenameMap)
                 end
             end
             if stmt.Rhs then
                 for _, expr in ipairs(stmt.Rhs) do
-                    renameInNode(expr, importedNames, importMap)
+                    renameInNode(expr, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif stmt.AstType == 'LocalStatement' then
             if stmt.InitList then
                 for _, expr in ipairs(stmt.InitList) do
-                    renameInNode(expr, importedNames, importMap)
+                    renameInNode(expr, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif stmt.AstType == 'ReturnStatement' and stmt.Arguments then
             for _, arg in ipairs(stmt.Arguments) do
-                renameInNode(arg, importedNames, importMap)
+                renameInNode(arg, importedNames, importMap, fileRenameMap)
             end
         elseif stmt.AstType == 'Function' and stmt.Body and stmt.Body.Body then
             for _, s in ipairs(stmt.Body.Body) do
-                renameInStatement(s, importedNames, importMap)
+                renameInStatement(s, importedNames, importMap, fileRenameMap)
             end
         elseif stmt.AstType == 'IfStatement' then
             -- Rename condition
             if stmt.Clauses then
                 for _, clause in ipairs(stmt.Clauses) do
                     if clause.Condition then
-                        renameInNode(clause.Condition, importedNames, importMap)
+                        renameInNode(clause.Condition, importedNames, importMap, fileRenameMap)
                     end
                     if clause.Body and clause.Body.Body then
                         for _, s in ipairs(clause.Body.Body) do
-                            renameInStatement(s, importedNames, importMap)
+                            renameInStatement(s, importedNames, importMap, fileRenameMap)
                         end
                     end
                 end
             end
         elseif stmt.AstType == 'WhileStatement' then
             if stmt.Condition then
-                renameInNode(stmt.Condition, importedNames, importMap)
+                renameInNode(stmt.Condition, importedNames, importMap, fileRenameMap)
             end
             if stmt.Body and stmt.Body.Body then
                 for _, s in ipairs(stmt.Body.Body) do
-                    renameInStatement(s, importedNames, importMap)
+                    renameInStatement(s, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif stmt.AstType == 'RepeatStatement' then
             if stmt.Condition then
-                renameInNode(stmt.Condition, importedNames, importMap)
+                renameInNode(stmt.Condition, importedNames, importMap, fileRenameMap)
             end
             if stmt.Body and stmt.Body.Body then
                 for _, s in ipairs(stmt.Body.Body) do
-                    renameInStatement(s, importedNames, importMap)
+                    renameInStatement(s, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif stmt.AstType == 'NumericForStatement' or stmt.AstType == 'GenericForStatement' then
             -- Rename loop expressions
-            if stmt.Start then renameInNode(stmt.Start, importedNames, importMap) end
-            if stmt.End then renameInNode(stmt.End, importedNames, importMap) end
-            if stmt.Step then renameInNode(stmt.Step, importedNames, importMap) end
+            if stmt.Start then renameInNode(stmt.Start, importedNames, importMap, fileRenameMap) end
+            if stmt.End then renameInNode(stmt.End, importedNames, importMap, fileRenameMap) end
+            if stmt.Step then renameInNode(stmt.Step, importedNames, importMap, fileRenameMap) end
             if stmt.Generators then
                 for _, gen in ipairs(stmt.Generators) do
-                    renameInNode(gen, importedNames, importMap)
+                    renameInNode(gen, importedNames, importMap, fileRenameMap)
                 end
             end
             if stmt.Body and stmt.Body.Body then
                 for _, s in ipairs(stmt.Body.Body) do
-                    renameInStatement(s, importedNames, importMap)
+                    renameInStatement(s, importedNames, importMap, fileRenameMap)
                 end
             end
         elseif stmt.AstType == 'DoStatement' then
             if stmt.Body and stmt.Body.Body then
                 for _, s in ipairs(stmt.Body.Body) do
-                    renameInStatement(s, importedNames, importMap)
+                    renameInStatement(s, importedNames, importMap, fileRenameMap)
                 end
             end
         end
@@ -693,7 +789,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
     -- Apply renames to all items
     for _, item in ipairs(allItems) do
-        renameInStatement(item.stmt, item.importedNames or {}, item.importMap or {})
+        renameInStatement(item.stmt, item.importedNames or {}, item.importMap or {}, item.fileRenameMap or {})
     end
 
     -- Build dependency lookup for just-in-time insertion
@@ -706,6 +802,9 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                 itemByName[item.name] = item
             elseif item.type == 'method' then
                 itemByName[item.methodPath or item.name] = item
+            elseif item.type == 'member_assignment' then
+                -- Register member assignments (e.g., TargetSquare.__index)
+                itemByName[item.name] = item
             elseif item.type == 'variable' then
                 for _, name in ipairs(item.names) do
                     itemByName[name] = item
@@ -734,41 +833,161 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         return a.stmtIndex < b.stmtIndex
     end)
 
-    -- Build output by processing entry file in order and inserting dependencies just-in-time
+    -- Build output: order files by dependencies, within each file only reorder when needed
     local sorted = {}
+    local addedFiles = {}
     local added = {}
+    local inProgress = {}  -- Track files currently being added (for cycle detection)
 
-    local function addItem(item)
-        if added[item.id] then
+    -- Build file-level dependency map
+    local fileDeps = {}  -- Maps filePath -> set of dependent file paths
+    for _, item in ipairs(importedItems) do
+        if not fileDeps[item.filePath] then
+            fileDeps[item.filePath] = {}
+        end
+
+        -- Track which files this file depends on
+        if item.importMap then
+            for alias, actualName in pairs(item.importMap) do
+                -- Find which file provides this name
+                local depItem = itemByName[actualName]
+                if depItem and depItem.filePath ~= item.filePath and depItem.filePath ~= entryFilePath then
+                    fileDeps[item.filePath][depItem.filePath] = true
+                end
+            end
+        end
+    end
+
+    -- Detect circular dependencies at file level
+    local circularFiles = {}  -- Set of files involved in circular dependencies
+    local function detectCircularDeps(filePath, visited, stack)
+        if circularFiles[filePath] then return end  -- Already processed
+        if stack[filePath] then
+            -- Found a cycle! Mark all files in the cycle
+            circularFiles[filePath] = true
+            return
+        end
+        if visited[filePath] then return end
+
+        visited[filePath] = true
+        stack[filePath] = true
+
+        if fileDeps[filePath] then
+            for depFilePath in pairs(fileDeps[filePath]) do
+                detectCircularDeps(depFilePath, visited, stack)
+                if circularFiles[depFilePath] then
+                    circularFiles[filePath] = true
+                end
+            end
+        end
+
+        stack[filePath] = nil
+    end
+
+    -- Run cycle detection on all imported files
+    for _, item in ipairs(importedItems) do
+        detectCircularDeps(item.filePath, {}, {})
+    end
+
+    -- For files with circular dependencies, just track them (no forward declarations)
+    local forwardDecls = {}  -- Maps varName -> true for variables in circular files
+    for filePath in pairs(circularFiles) do
+        for _, item in ipairs(importedItems) do
+            if item.filePath == filePath and item.isDeclaration then
+                if item.type == 'variable' then
+                    for _, name in ipairs(item.names) do
+                        forwardDecls[name] = true
+                    end
+                elseif item.type == 'function' then
+                    forwardDecls[item.name] = true
+                end
+            end
+        end
+    end
+
+    -- Recursive function to add items with dependencies
+    local addingStack = {}  -- Track items currently being added (for circular dependency detection)
+
+    local function addItemWithDeps(item, skipForwardDecls)
+        if added[item.id] then return end
+        if addingStack[item.id] then
+            -- Circular dependency within statements - the forward declaration will handle this
             return
         end
 
-        -- Add dependencies first (just-in-time)
+        addingStack[item.id] = true
+
+        -- Add dependencies first
         for depName in pairs(item.dependencies) do
             local resolvedName = depName
+            -- Resolve through import map
             if item.importMap and item.importMap[depName] then
                 resolvedName = item.importMap[depName]
             end
-
             local depItem = itemByName[resolvedName]
+
+            -- Add dependency if:
+            -- 1. It's in the same file (always reorder within file)
+            -- 2. OR it's a forward-declared item (cross-file circular dependency)
             if depItem and depItem.id ~= item.id and not added[depItem.id] then
-                addItem(depItem)
+                if depItem.filePath == item.filePath then
+                    -- Same file - always add dependency first
+                    addItemWithDeps(depItem, skipForwardDecls)
+                elseif forwardDecls[resolvedName] then
+                    -- Cross-file circular dependency - add the dependency before this item
+                    -- Find the file and add it if not already added
+                    local depIsCircular = circularFiles[depItem.filePath]
+                    addItemWithDeps(depItem, depIsCircular)
+                end
             end
         end
 
-        -- Add this item
+        addingStack[item.id] = nil
+
+        -- For circular dependencies, just add the statements as-is (they stay as local function/local var)
+        -- The dependency ordering already ensures correct order
+
         table.insert(sorted, item)
         added[item.id] = true
     end
 
-    -- Process entry file items first (they'll pull in dependencies as needed)
-    for _, item in ipairs(entryItems) do
-        addItem(item)
+    -- Recursive function to add entire files (with cycle detection)
+    local function addFile(filePath)
+        if addedFiles[filePath] then return end
+        if inProgress[filePath] then
+            -- Circular dependency detected - skip for now
+            return
+        end
+
+        inProgress[filePath] = true
+
+        -- Add dependent files first (but skip if they create cycles)
+        if fileDeps[filePath] then
+            for depFilePath in pairs(fileDeps[filePath]) do
+                addFile(depFilePath)
+            end
+        end
+
+        addedFiles[filePath] = true
+        inProgress[filePath] = nil
+
+        -- Add all items from this file, reordering only when there are dependencies
+        local isCircular = circularFiles[filePath]
+        for _, item in ipairs(importedItems) do
+            if item.filePath == filePath then
+                addItemWithDeps(item, isCircular)
+            end
+        end
     end
 
-    -- Process any remaining imported items that weren't pulled in as dependencies
+    -- Add all imported files in dependency order
     for _, item in ipairs(importedItems) do
-        addItem(item)
+        addFile(item.filePath)
+    end
+
+    -- Add all entry file items in their original order (no reordering for entry file)
+    for _, item in ipairs(entryItems) do
+        table.insert(sorted, item)
     end
 
     -- Generate output AST
