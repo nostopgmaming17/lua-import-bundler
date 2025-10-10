@@ -1,4 +1,4 @@
-# Lua ES6 Import Bundler
+# Lua Import Bundler
 
 A modern JavaScript/TypeScript-style import/export bundler for Lua and Luau. Write modular Lua code with ES6-style `import`/`export` syntax and bundle it into a single optimized file.
 
