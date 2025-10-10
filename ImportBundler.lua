@@ -741,8 +741,56 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         for originalName in pairs(exports) do
             if exportedVars[filePath] and exportedVars[filePath][originalName] then
                 local currentName = exportedVars[filePath][originalName]
-                -- Get a new unique name for this export
-                local newName = getUniqueName(currentName)
+
+                -- Keep renaming until we find a name that doesn't conflict
+                -- This handles cases like: module exports 'config', entry has 'config' and 'config2'
+                -- First rename: config -> config2 (conflict!)
+                -- Second rename: config2 -> config3 (no conflict, done)
+
+                -- Extract base name and starting counter
+                local baseName = currentName
+                local counter = 2
+                -- Check if currentName already has a number suffix (e.g., "config2")
+                local nameWithoutNumber = currentName:match("^(.-)%d+$")
+                if nameWithoutNumber then
+                    baseName = nameWithoutNumber
+                    local numberPart = currentName:match("%d+$")
+                    if numberPart then
+                        counter = tonumber(numberPart) + 1
+                    end
+                end
+
+                local newName = baseName .. counter
+                -- Make sure this new name is registered as used
+                usedNames[newName] = true
+
+                local needsAnotherRename = true
+                local maxIterations = 100  -- Safety limit to prevent infinite loops
+                local iterations = 0
+
+                while needsAnotherRename and iterations < maxIterations do
+                    iterations = iterations + 1
+                    needsAnotherRename = false
+
+                    -- Check if the new name conflicts with any variables in ANY file
+                    for _, item in ipairs(allItems) do
+                        -- Check dependencies of each item
+                        for depName in pairs(item.dependencies) do
+                            if depName == newName then
+                                -- This new name is used somewhere! Need to rename again
+                                -- But only if it's in a different file or not from an import
+                                if item.filePath ~= filePath or not (item.importMap and item.importMap[depName]) then
+                                    counter = counter + 1
+                                    newName = baseName .. counter
+                                    usedNames[newName] = true
+                                    needsAnotherRename = true
+                                    break
+                                end
+                            end
+                        end
+                        if needsAnotherRename then break end
+                    end
+                end
 
                 -- Update exportedVars to use the new name
                 exportedVars[filePath][originalName] = newName
