@@ -492,10 +492,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                     elseif not isMethod then
                         -- Non-exported local function (from any file)
                         uniqueName = getUniqueName(originalName)
-                        -- Only add to globalRenameMap if this is from the entry file OR if it actually got renamed
-                        if uniqueName ~= originalName then
-                            globalRenameMap[originalName] = uniqueName
-                        end
+                        -- Don't add to globalRenameMap - local variables should only affect their own file
                     else
                         -- Method definition - keep the original path structure but rename if needed
                         uniqueName = originalName
@@ -558,10 +555,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                         else
                             -- Non-exported local variable (from any file)
                             uniqueName = getUniqueName(originalName)
-                            -- Only add to globalRenameMap if it actually got renamed
-                            if uniqueName ~= originalName then
-                                globalRenameMap[originalName] = uniqueName
-                            end
+                            -- Don't add to globalRenameMap - local variables should only affect their own file
                         end
 
                         table.insert(uniqueNames, uniqueName)
@@ -760,37 +754,38 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                     end
                 end
 
-                local newName = baseName .. counter
-                -- Make sure this new name is registered as used
-                usedNames[newName] = true
-
-                local needsAnotherRename = true
-                local maxIterations = 100  -- Safety limit to prevent infinite loops
-                local iterations = 0
-
-                while needsAnotherRename and iterations < maxIterations do
-                    iterations = iterations + 1
-                    needsAnotherRename = false
-
-                    -- Check if the new name conflicts with any variables in ANY file
-                    for _, item in ipairs(allItems) do
-                        -- Check dependencies of each item
-                        for depName in pairs(item.dependencies) do
-                            if depName == newName then
-                                -- This new name is used somewhere! Need to rename again
-                                -- But only if it's in a different file or not from an import
-                                if item.filePath ~= filePath or not (item.importMap and item.importMap[depName]) then
-                                    counter = counter + 1
-                                    newName = baseName .. counter
-                                    usedNames[newName] = true
-                                    needsAnotherRename = true
-                                    break
+                -- Find a name that's not in usedNames and doesn't conflict
+                local newName
+                repeat
+                    newName = baseName .. counter
+                    if usedNames[newName] then
+                        -- Already used, try next number
+                        counter = counter + 1
+                    else
+                        -- Not in usedNames, but check if it conflicts with dependencies
+                        local hasConflict = false
+                        for _, item in ipairs(allItems) do
+                            for depName in pairs(item.dependencies) do
+                                if depName == newName then
+                                    -- This new name is used somewhere! Need to rename again
+                                    -- But only if it's in a different file or not from an import
+                                    if item.filePath ~= filePath or not (item.importMap and item.importMap[depName]) then
+                                        counter = counter + 1
+                                        hasConflict = true
+                                        break
+                                    end
                                 end
                             end
+                            if hasConflict then break end
                         end
-                        if needsAnotherRename then break end
+
+                        if not hasConflict then
+                            -- Found a good name!
+                            usedNames[newName] = true
+                            break
+                        end
                     end
-                end
+                until counter > 1000  -- Safety limit
 
                 -- Update exportedVars to use the new name
                 exportedVars[filePath][originalName] = newName
