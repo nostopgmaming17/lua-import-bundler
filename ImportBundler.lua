@@ -208,6 +208,58 @@ function extractIdentifiersFromStatement(stmt, identifiers)
                 extractIdentifiersFromStatement(s, identifiers)
             end
         end
+    elseif stmt.AstType == 'IfStatement' then
+        if stmt.Clauses then
+            for _, clause in ipairs(stmt.Clauses) do
+                if clause.Condition then
+                    extractIdentifiers(clause.Condition, identifiers)
+                end
+                if clause.Body and clause.Body.Body then
+                    for _, s in ipairs(clause.Body.Body) do
+                        extractIdentifiersFromStatement(s, identifiers)
+                    end
+                end
+            end
+        end
+    elseif stmt.AstType == 'WhileStatement' then
+        if stmt.Condition then
+            extractIdentifiers(stmt.Condition, identifiers)
+        end
+        if stmt.Body and stmt.Body.Body then
+            for _, s in ipairs(stmt.Body.Body) do
+                extractIdentifiersFromStatement(s, identifiers)
+            end
+        end
+    elseif stmt.AstType == 'RepeatStatement' then
+        if stmt.Condition then
+            extractIdentifiers(stmt.Condition, identifiers)
+        end
+        if stmt.Body and stmt.Body.Body then
+            for _, s in ipairs(stmt.Body.Body) do
+                extractIdentifiersFromStatement(s, identifiers)
+            end
+        end
+    elseif stmt.AstType == 'NumericForStatement' or stmt.AstType == 'GenericForStatement' then
+        -- Extract from loop expressions
+        if stmt.Start then extractIdentifiers(stmt.Start, identifiers) end
+        if stmt.End then extractIdentifiers(stmt.End, identifiers) end
+        if stmt.Step then extractIdentifiers(stmt.Step, identifiers) end
+        if stmt.Generators then
+            for _, gen in ipairs(stmt.Generators) do
+                extractIdentifiers(gen, identifiers)
+            end
+        end
+        if stmt.Body and stmt.Body.Body then
+            for _, s in ipairs(stmt.Body.Body) do
+                extractIdentifiersFromStatement(s, identifiers)
+            end
+        end
+    elseif stmt.AstType == 'DoStatement' then
+        if stmt.Body and stmt.Body.Body then
+            for _, s in ipairs(stmt.Body.Body) do
+                extractIdentifiersFromStatement(s, identifiers)
+            end
+        end
     end
 
     return identifiers
@@ -227,17 +279,16 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
 
     -- Recursively gather all files
     local function gatherFiles(filePath, baseDir)
-        local fullPath = normalizePath(baseDir .. filePath)
-
-        if processed[fullPath] then
-            return
-        end
-        processed[fullPath] = true
-
         local content, resolvedPath = readFile(filePath, baseDir)
         if not content then
             error("Could not read file: " .. filePath)
         end
+
+        -- Use the resolved path (with extension) as the canonical path
+        if processed[resolvedPath] then
+            return
+        end
+        processed[resolvedPath] = true
 
         -- Apply define replacements to raw content FIRST
         for varName, value in pairs(define) do
@@ -260,7 +311,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         end
 
         local fileInfo = {
-            path = fullPath,
+            path = resolvedPath,  -- Use the actual resolved path from readFile
             name = filePath:match("([^/]+)$"),
             imports = result.imports,
             exports = result.exports,
@@ -269,7 +320,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         }
 
         table.insert(files, fileInfo)
-        fileData[fullPath] = fileInfo
+        fileData[resolvedPath] = fileInfo
 
         -- Process dependencies
         for _, imp in ipairs(result.imports) do
@@ -412,7 +463,11 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                 -- No prefix, treat as relative
             end
 
-            local sourceFullPath = normalizePath(sourceDir .. sourcePath)
+            -- Resolve to actual file path (with extension) - same as gatherFiles does
+            local _, sourceFullPath = readFile(sourcePath, sourceDir)
+            if not sourceFullPath then
+                error("Could not resolve import source: " .. imp.source .. " from " .. file.path)
+            end
 
             for _, item in ipairs(imp.imports) do
                 -- Find the actual renamed variable from the source file
@@ -1124,15 +1179,19 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
             -- Add dependency if:
             -- 1. It's in the same file (always reorder within file)
             -- 2. OR it's a forward-declared item (cross-file circular dependency)
+            -- 3. OR it's an imported item (imported from another file including entry)
             if depItem and depItem.id ~= item.id and not added[depItem.id] then
                 if depItem.filePath == item.filePath then
                     -- Same file - always add dependency first
                     addItemWithDeps(depItem, skipForwardDecls)
                 elseif forwardDecls[resolvedName] then
                     -- Cross-file circular dependency - add the dependency before this item
-                    -- Find the file and add it if not already added
                     local depIsCircular = circularFiles[depItem.filePath]
                     addItemWithDeps(depItem, depIsCircular)
+                elseif item.importMap and item.importMap[depName] then
+                    -- This item imports this dependency - add it regardless of which file it's from
+                    -- This handles imports from the entry file or from other circular dependencies
+                    addItemWithDeps(depItem, depItem.filePath == entryFilePath and false or circularFiles[depItem.filePath])
                 end
             end
         end
@@ -1181,8 +1240,12 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
     end
 
     -- Add all entry file items in their original order (no reordering for entry file)
+    -- Only add if not already added during dependency resolution
     for _, item in ipairs(entryItems) do
-        table.insert(sorted, item)
+        if not added[item.id] then
+            table.insert(sorted, item)
+            added[item.id] = true
+        end
     end
 
     -- Generate output AST
