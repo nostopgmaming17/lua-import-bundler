@@ -108,7 +108,7 @@ local function extractIdentifiers(node, identifiers, isCallBase)
 
     if node.AstType == 'VarExpr' then
         identifiers[node.Name] = true
-    elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' then
+    elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' or node.AstType == 'InterpolatedStringCallExpr' then
         -- For calls, track the full member path if it's a method/property call
         local memberPath = getMemberPath(node.Base)
         if memberPath and memberPath:find("%.") then
@@ -173,6 +173,26 @@ local function extractIdentifiers(node, identifiers, isCallBase)
             for _, entry in ipairs(node.EntryList) do
                 if entry.Key then extractIdentifiers(entry.Key, identifiers, false) end
                 if entry.Value then extractIdentifiers(entry.Value, identifiers, false) end
+            end
+        end
+    elseif node.AstType == 'InterpolatedStringExpr' then
+        -- Extract identifiers from interpolated string expression segments
+        if node.Segments then
+            for _, segment in ipairs(node.Segments) do
+                if segment.Type == 'Expression' and segment.Value then
+                    extractIdentifiers(segment.Value, identifiers, false)
+                end
+            end
+        end
+    elseif node.AstType == 'InterpolatedStringCallExpr' then
+        local memberPath = getMemberPath(node.Base)
+        if memberPath and memberPath:find("%.") then
+            identifiers[memberPath] = true
+        end
+        extractIdentifiers(node.Base, identifiers, true)
+        if node.Arguments then
+            for _, arg in ipairs(node.Arguments) do
+                extractIdentifiers(arg, identifiers, false)
             end
         end
     end
@@ -917,11 +937,20 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
                     node.Variable.Name = node.Name
                 end
             end
-        elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' then
+        elseif node.AstType == 'CallExpr' or node.AstType == 'TableCallExpr' or node.AstType == 'StringCallExpr' or node.AstType == 'InterpolatedStringCallExpr' then
             renameInNode(node.Base, importedNames, importMap, fileRenameMap)
             if node.Arguments then
                 for _, arg in ipairs(node.Arguments) do
                     renameInNode(arg, importedNames, importMap, fileRenameMap)
+                end
+            end
+        elseif node.AstType == 'InterpolatedStringExpr' then
+            -- Rename inside interpolated string expression segments
+            if node.Segments then
+                for _, segment in ipairs(node.Segments) do
+                    if segment.Type == 'Expression' and segment.Value then
+                        renameInNode(segment.Value, importedNames, importMap, fileRenameMap)
+                    end
                 end
             end
         elseif node.AstType == 'BinopExpr' then

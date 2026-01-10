@@ -307,6 +307,190 @@ local function LexLua(src)
 				local constant = src:sub(start, p-1)
 				toEmit = {Type = 'String', Data = constant, Constant = content}
 
+			elseif c == '`' then
+				-- Luau interpolated string: `text {expr} more text`
+				local start = p
+				get() -- consume opening backtick
+				local segments = {}
+				local literalStart = p
+
+				while true do
+					local c = peek()
+					if c == '`' then
+						-- End of interpolated string
+						local currentLiteral = src:sub(literalStart, p - 1)
+						if #currentLiteral > 0 then
+							segments[#segments + 1] = {Type = 'Literal', Value = currentLiteral}
+						end
+						get() -- consume closing backtick
+						break
+					elseif c == '\\' then
+						-- Escape sequence - include both chars in literal
+						get()
+						local escaped = get()
+						if escaped == '' then
+							generateError("Unfinished string near <eof>")
+						end
+					elseif c == '{' then
+						-- Start of expression interpolation
+						-- Save current literal segment
+						local currentLiteral = src:sub(literalStart, p - 1)
+						if #currentLiteral > 0 then
+							segments[#segments + 1] = {Type = 'Literal', Value = currentLiteral}
+						end
+						get() -- consume '{'
+
+						-- Track brace depth for nested tables/functions
+						local depth = 1
+						local exprStart = p
+
+						while depth > 0 do
+							local ec = peek()
+							if ec == '' then
+								generateError("Unfinished interpolated expression near <eof>")
+							elseif ec == '{' then
+								depth = depth + 1
+								get()
+							elseif ec == '}' then
+								depth = depth - 1
+								if depth > 0 then
+									get()
+								end
+							elseif ec == '"' or ec == "'" then
+								-- String inside expression - skip it properly
+								local strDelim = get()
+								while true do
+									local sc = get()
+									if sc == '\\' then
+										get()
+									elseif sc == strDelim then
+										break
+									elseif sc == '' then
+										generateError("Unfinished string in interpolated expression near <eof>")
+									end
+								end
+							elseif ec == '[' and peek(1) == '[' then
+								-- Long string - skip it
+								get() get()
+								while true do
+									if peek() == ']' and peek(1) == ']' then
+										get() get()
+										break
+									elseif peek() == '' then
+										generateError("Unfinished long string in interpolated expression near <eof>")
+									else
+										get()
+									end
+								end
+							elseif ec == '[' and peek(1) == '=' then
+								-- Long string with equals - skip it
+								local eqCount = 0
+								get() -- consume '['
+								while peek() == '=' do
+									eqCount = eqCount + 1
+									get()
+								end
+								if peek() == '[' then
+									get() -- consume second '['
+									-- Find matching ]=*]
+									while true do
+										if peek() == ']' then
+											local matchEq = 0
+											get()
+											while peek() == '=' and matchEq < eqCount do
+												matchEq = matchEq + 1
+												get()
+											end
+											if matchEq == eqCount and peek() == ']' then
+												get()
+												break
+											end
+										elseif peek() == '' then
+											generateError("Unfinished long string in interpolated expression near <eof>")
+										else
+											get()
+										end
+									end
+								end
+							elseif ec == '-' and peek(1) == '-' then
+								-- Comment in expression - skip to end of line or long comment
+								get() get()
+								if peek() == '[' and (peek(1) == '[' or peek(1) == '=') then
+									-- Long comment
+									local _, _ = tryGetLongString()
+								else
+									while peek() ~= '\n' and peek() ~= '' do
+										get()
+									end
+								end
+							elseif ec == '`' then
+								-- Nested interpolated string - skip it entirely
+								get() -- consume backtick
+								local nestedDepth = 1
+								while nestedDepth > 0 do
+									local nc = peek()
+									if nc == '' then
+										generateError("Unfinished nested interpolated string near <eof>")
+									elseif nc == '\\' then
+										get() get()
+									elseif nc == '`' then
+										nestedDepth = nestedDepth - 1
+										if nestedDepth > 0 then get() end
+									elseif nc == '{' then
+										get()
+										local nestedBraceDepth = 1
+										while nestedBraceDepth > 0 do
+											local nbc = peek()
+											if nbc == '' then
+												generateError("Unfinished nested interpolation near <eof>")
+											elseif nbc == '{' then
+												nestedBraceDepth = nestedBraceDepth + 1
+												get()
+											elseif nbc == '}' then
+												nestedBraceDepth = nestedBraceDepth - 1
+												if nestedBraceDepth > 0 then get() end
+											elseif nbc == '\\' then
+												get() get()
+											elseif nbc == '"' or nbc == "'" then
+												local sd = get()
+												while true do
+													local sc = get()
+													if sc == '\\' then get()
+													elseif sc == sd then break
+													elseif sc == '' then break
+													end
+												end
+											else
+												get()
+											end
+										end
+										get() -- consume the final '}'
+									else
+										get()
+									end
+								end
+								get() -- consume closing backtick
+							else
+								get()
+							end
+						end
+
+						-- Extract the expression source (excluding the closing brace)
+						local exprSource = src:sub(exprStart, p - 1)
+						segments[#segments + 1] = {Type = 'Expression', Source = exprSource}
+
+						get() -- consume closing '}'
+						literalStart = p
+					elseif c == '' then
+						generateError("Unfinished interpolated string near <eof>")
+					else
+						get()
+					end
+				end
+
+				local fullString = src:sub(start, p - 1)
+				toEmit = {Type = 'InterpolatedString', Data = fullString, Segments = segments}
+
 			elseif c == '[' then
 				local content, wholetext = tryGetLongString()
 				if wholetext then
@@ -774,6 +958,18 @@ local function ParseLua(src)
 				--
 				prim = nodeCall
 
+			elseif not onlyDotColon and tok:Is('InterpolatedString') then
+				--interpolated string call
+				local st, interpExpr = ParseSimpleExpr(scope)
+				if not st then return false, interpExpr end
+				local nodeCall = {}
+				nodeCall.AstType    = 'InterpolatedStringCallExpr'
+				nodeCall.Base       = prim
+				nodeCall.Arguments  = { interpExpr }
+				nodeCall.Tokens     = tokenList
+				--
+				prim = nodeCall
+
 			elseif not onlyDotColon and tok:IsSymbol('{') then
 				--table call
 				local st, ex = ParseSimpleExpr(scope)
@@ -812,6 +1008,85 @@ local function ParseLua(src)
 			nodeStr.Value   = tok:Get(tokenList)
 			nodeStr.Tokens  = tokenList
 			return true, nodeStr
+
+		elseif tok:Is('InterpolatedString') then
+			local token = tok:Get(tokenList)
+			local nodeInterp = {}
+			nodeInterp.AstType = 'InterpolatedStringExpr'
+			nodeInterp.Segments = {}
+			nodeInterp.RawToken = token
+
+			-- Helper function to link variable references to the current scope
+			local function linkVariablesToScope(node, parentScope)
+				if not node or type(node) ~= 'table' then return end
+				if node.AstType == 'VarExpr' then
+					-- Look up the variable in the parent scope
+					local existingVar = parentScope:GetLocal(node.Name)
+					if existingVar then
+						node.Variable = existingVar
+						existingVar.References = (existingVar.References or 0) + 1
+					else
+						-- Check if it's a global we know about
+						local globalVar = parentScope:GetGlobal(node.Name)
+						if globalVar then
+							node.Variable = globalVar
+							globalVar.References = (globalVar.References or 0) + 1
+						end
+					end
+				end
+				-- Recursively process children
+				for key, child in pairs(node) do
+					if type(child) == 'table' and key ~= 'Tokens' and key ~= 'Variable' then
+						linkVariablesToScope(child, parentScope)
+					end
+				end
+			end
+
+			for _, segment in ipairs(token.Segments) do
+				if segment.Type == 'Literal' then
+					nodeInterp.Segments[#nodeInterp.Segments + 1] = {
+						Type = 'Literal',
+						Value = segment.Value
+					}
+				elseif segment.Type == 'Expression' then
+					-- Parse the expression source code by wrapping in "return <expr>"
+					-- This ensures the expression is parsed correctly
+					local exprSource = segment.Source
+					local wrappedSource = "return " .. exprSource
+					local wrapLexSuccess, wrapTok = LexLua(wrappedSource)
+					if not wrapLexSuccess then
+						return false, GenerateError("Failed to lex interpolated expression: " .. tostring(wrapTok))
+					end
+					local wrapParseSuccess, wrapAst = ParseLua(wrapTok)
+					if not wrapParseSuccess then
+						return false, GenerateError("Failed to parse interpolated expression: " .. tostring(wrapAst))
+					end
+
+					local expr = nil
+					if wrapAst and wrapAst.Body and #wrapAst.Body > 0 then
+						local returnStmt = wrapAst.Body[1]
+						if returnStmt.AstType == 'ReturnStatement' and returnStmt.Arguments and #returnStmt.Arguments > 0 then
+							expr = returnStmt.Arguments[1]
+						end
+					end
+
+					if expr then
+						-- Link variable references to the current scope
+						linkVariablesToScope(expr, scope)
+
+						nodeInterp.Segments[#nodeInterp.Segments + 1] = {
+							Type = 'Expression',
+							Value = expr,
+							Source = exprSource
+						}
+					else
+						return false, GenerateError("Invalid expression in string interpolation: " .. exprSource)
+					end
+				end
+			end
+
+			nodeInterp.Tokens = tokenList
+			return true, nodeInterp
 
 		elseif tok:ConsumeKeyword('nil', tokenList) then
 			local nodeNil = {}
@@ -1404,7 +1679,8 @@ local function ParseLua(src)
 
 			elseif suffixed.AstType == 'CallExpr' or
 				   suffixed.AstType == 'TableCallExpr' or
-				   suffixed.AstType == 'StringCallExpr'
+				   suffixed.AstType == 'StringCallExpr' or
+				   suffixed.AstType == 'InterpolatedStringCallExpr'
 			then
 				--it's a call statement
 				local nodeCall = {}

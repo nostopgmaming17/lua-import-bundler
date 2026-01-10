@@ -73,6 +73,17 @@ local function Format_Beautify(ast)
 		elseif expr.AstType == 'StringExpr' then
 			out = out..expr.Value.Data
 
+		elseif expr.AstType == 'InterpolatedStringExpr' then
+			out = out .. '`'
+			for _, segment in ipairs(expr.Segments) do
+				if segment.Type == 'Literal' then
+					out = out .. segment.Value
+				elseif segment.Type == 'Expression' then
+					out = out .. '{' .. formatExpr(segment.Value) .. '}'
+				end
+			end
+			out = out .. '`'
+
 		elseif expr.AstType == 'BooleanExpr' then
 			out = out..tostring(expr.Value)
 
@@ -109,6 +120,10 @@ local function Format_Beautify(ast)
 		elseif expr.AstType == 'StringCallExpr' then
 			out = out..formatExpr(expr.Base) .. " "
 			out = out..expr.Arguments[1].Data
+
+		elseif expr.AstType == 'InterpolatedStringCallExpr' then
+			out = out..formatExpr(expr.Base) .. " "
+			out = out..formatExpr(expr.Arguments[1])
 
 		elseif expr.AstType == 'IndexExpr' then
 			out = out..formatExpr(expr.Base).."["..formatExpr(expr.Index).."]"
