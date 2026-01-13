@@ -36,7 +36,7 @@ local function main(args)
     local entrypoint = args[1]
 
     -- Generate default output name
-    local output = "bundled.min.lua"
+    local output = "bundled.lua"
     local minify = false
     local define = {}
     local mangle = "none"
