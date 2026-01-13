@@ -36,10 +36,7 @@ local function main(args)
     local entrypoint = args[1]
 
     -- Generate default output name
-    local outputName = entrypoint:match("([^/\\]+)$") or entrypoint
-    outputName = outputName:gsub("%.lua$", "")
-    outputName = outputName:gsub("%.luau$", "")
-    local output = "out/" .. outputName .. ".lua"
+    local output = "bundled.min.lua"
     local minify = false
     local define = {}
     local mangle = "none"
