@@ -120,6 +120,7 @@ lua import_bundle.lua <entrypoint> [options]
 - `-minify` - Enable minification (automatically renames local variables)
 - `-mangle` - Mangle properties starting with `_` (excludes `__*`)
 - `-automangle` - Mangle ALL properties except `__*` (⚠️ Not recommended)
+- `-mangleWhitelist <names>` - Comma-separated property names to skip mangling
 - `-d <var>=<val>` - Define variable replacement
 
 **Examples:**

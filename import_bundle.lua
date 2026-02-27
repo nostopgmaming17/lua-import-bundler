@@ -24,6 +24,7 @@ local function main(args)
         print("  -d <var>=<val>     Define variable replacement")
         print("  -mangle            Enable variable name mangling")
         print("  -automangle        Enable automatic variable name mangling")
+        print("  -mangleWhitelist <names>  Comma-separated property names to skip mangling")
         print("")
         print("Examples:")
         print("  lua import_bundle.lua src/main.lua")
@@ -40,6 +41,7 @@ local function main(args)
     local minify = false
     local define = {}
     local mangle = "none"
+    local mangleWhitelist = {}
 
     -- Parse arguments
     local i = 2
@@ -62,6 +64,11 @@ local function main(args)
         elseif args[i]:lower() == "-automangle" then
             mangle = "auto"
             i = i + 1
+        elseif args[i]:lower() == "-manglewhitelist" and i + 1 <= #args then
+            for name in args[i + 1]:gmatch("[^,]+") do
+                mangleWhitelist[name:match("^%s*(.-)%s*$")] = true
+            end
+            i = i + 2
         else
             i = i + 1
         end
@@ -69,7 +76,7 @@ local function main(args)
 
     -- Bundle
     local success, result = pcall(function()
-        return ImportBundler.bundle(entrypoint, minify, define, mangle)
+        return ImportBundler.bundle(entrypoint, minify, define, mangle, mangleWhitelist)
     end)
 
     if not success then

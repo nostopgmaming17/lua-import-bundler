@@ -286,13 +286,14 @@ function extractIdentifiersFromStatement(stmt, identifiers)
 end
 
 -- Bundle files with import/export
-function ImportBundler.bundle(entryPath, minify, define, mangle)
+function ImportBundler.bundle(entryPath, minify, define, mangle, mangleWhitelist)
     local files = {}
     local fileData = {}
     local processed = {}
     minify = minify or false
     define = define or {}
     mangle = mangle or "none"
+    mangleWhitelist = mangleWhitelist or {}
 
     -- Determine project root (directory containing entry file)
     local projectRoot = getDirectory(entryPath)
@@ -1301,7 +1302,7 @@ function ImportBundler.bundle(entryPath, minify, define, mangle)
         end
         -- Apply mangling if requested
         if mangle ~= "none" then
-            ast = Mangle(ast, mangle == "auto")
+            ast = Mangle(ast, mangle == "auto", mangleWhitelist)
         end
         output = Format_Mini(ast)
     else

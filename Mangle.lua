@@ -79,7 +79,7 @@ end
 -- @param ast The Abstract Syntax Tree to be processed.
 -- @return The modified Abstract Syntax Tree.
 --
-local function processAstAndMangleProperties(ast, auto)
+local function processAstAndMangleProperties(ast, auto, whitelist)
     -- Character sets for name generation
     local chars_first = "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ_"
     local chars_all = chars_first .. "0123456789"
@@ -125,6 +125,7 @@ local function processAstAndMangleProperties(ast, auto)
     -- Gets an existing mangled name or creates a new one for an original property name.
     --
     function context.getMangledName(originalName)
+        if whitelist[originalName] then return originalName end
         if originalName:sub(1,2) == "__" then return originalName end
         if not auto and originalName:sub(1,1) ~= "_" then return originalName end
         if auto and originalName:sub(1,1) == "_" then return originalName:sub(2) end
